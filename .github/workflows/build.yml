@@ -33,9 +33,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WORKFLOW_REV: "7"
+  WORKFLOW_REV: "8"
+  # 16 chars: the payload carries com.apple.Terminal (18), and the Mach-O
+  # byte patch only fits equal-or-shorter replacements.  Keep under 18.
+  BUNDLE_ID: ${{ secrets.BUNDLE_ID || 'com.jq.terminal' }}
   APP_GROUP_ID: ${{ secrets.APP_GROUP_ID || 'group.com.jasonquiles.terminal' }}
-  BUNDLE_ID: ${{ secrets.BUNDLE_ID || 'com.jasonquiles.terminal' }}
   TEAM_ID: ${{ secrets.TEAM_ID }}
   OLD_GROUP: ${{ secrets.OLD_GROUP }}
   OLD_BUNDLE: ${{ secrets.OLD_BUNDLE }}
@@ -51,12 +53,14 @@ jobs:
 
       - name: Report runner
         run: |
-          echo "rev   : $WORKFLOW_REV   (must be 7)"
+          echo "rev   : $WORKFLOW_REV   (must be 8)"
           echo "arch  : $(uname -m)"
           echo "xcode : $(xcodebuild -version | head -1)"
           echo "sha   : $GITHUB_SHA"
           echo "event : $GITHUB_EVENT_NAME"
           echo "repo  : $GITHUB_REPOSITORY"
+          echo "bundle: $BUNDLE_ID ($(printf '%s' "$BUNDLE_ID" | wc -c | tr -d ' ') chars)"
+          echo "group : $APP_GROUP_ID"
 
       - name: Install toolchain
         run: |
@@ -74,16 +78,13 @@ jobs:
           VARIABLE_URL: ${{ vars.ASHELL_IPA_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "rev     : $WORKFLOW_REV (must be 7)"
+          echo "rev     : $WORKFLOW_REV (must be 8)"
           echo "own repo: $OWN_REPO"
-          echo "tag     : ${TAG:-<blank>}"
 
           emit() { echo "kind=$1" >> "$GITHUB_OUTPUT"; echo "value=$2" >> "$GITHUB_OUTPUT"; }
 
-          # 1: explicit URL
           if [ -n "${INPUT_URL:-}" ]; then emit url "$INPUT_URL"; echo "source: dispatch input"; exit 0; fi
 
-          # 2: committed archive
           LOCAL="$(find ipa -maxdepth 2 \( -iname '*.ipa' -o -iname '*.zip' \
                    -o -iname '*.tar.gz' -o -iname '*.tgz' \) -print 2>/dev/null | head -1)"
           if [ -n "$LOCAL" ]; then
@@ -92,7 +93,6 @@ jobs:
             exit 0
           fi
 
-          # 3-4: stored config
           if [ -n "${SECRET_URL:-}" ]; then emit url "$SECRET_URL"; echo "source: secret"; exit 0; fi
           if [ -n "${VARIABLE_URL:-}" ]; then emit url "$VARIABLE_URL"; echo "source: variable"; exit 0; fi
 
@@ -117,7 +117,6 @@ jobs:
               | grep -iE "$2" | head -1 || true
           }
 
-          # 5: own repo first - this is where the release lives
           echo "GET releases/latest on $OWN_REPO"
           fetch "https://api.github.com/repos/$OWN_REPO/releases/latest"
           echo "  status: $STATUS"
@@ -139,7 +138,6 @@ jobs:
             echo "  own release has no usable asset"
           fi
 
-          # 6: configured / upstream repo
           echo "GET releases/latest on $SRC_REPO"
           fetch "https://api.github.com/repos/$SRC_REPO/releases/latest"
           echo "  status: $STATUS"
@@ -182,7 +180,6 @@ jobs:
               http://*|https://*) ;;
               *) echo "::error::URL must start with http:// or https:// (got: $VALUE)"; exit 1 ;;
             esac
-
             AUTH=()
             case "$VALUE" in
               *github.com/*|*githubusercontent.com/*)
@@ -192,7 +189,6 @@ jobs:
                 fi
                 ;;
             esac
-
             if ! curl -fL --location-trusted --retry 3 --retry-delay 2 \
                  --max-time 900 "${AUTH[@]}" -o work/incoming "$VALUE"; then
               echo "::error::download failed"
@@ -233,9 +229,25 @@ jobs:
             exit 1
           fi
           echo "app: $APP"
-          mv "$APP" work/Terminal.app
+
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" 2>/dev/null || true)"
+          if [ -z "$EXEC" ] || [ ! -f "$APP/$EXEC" ]; then
+            EXEC="$(find "$APP" -maxdepth 1 -type f -perm -u+x -print -quit | xargs -r basename)"
+          fi
+          echo "executable: ${EXEC:-<unresolved>}"
+          if [ -z "$EXEC" ] || [ ! -f "$APP/$EXEC" ]; then
+            echo "::error::cannot resolve main executable"
+            ls -la "$APP" | head -30
+            exit 1
+          fi
+
           echo "APP=work/Terminal.app" >> "$GITHUB_ENV"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' work/Terminal.app/Info.plist
+          echo "EXEC=$EXEC" >> "$GITHUB_ENV"
+
+          echo "--- current identity ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist" 2>/dev/null || echo "(no AppGroupIdentifier)"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" || true
 
       - name: Rewrite author identity
         run: |
@@ -243,6 +255,9 @@ jobs:
           if [ -n "$OLD_GROUP" ]; then args+=(--old-group "$OLD_GROUP"); fi
           if [ -n "$OLD_BUNDLE" ]; then args+=(--old-bundle "$OLD_BUNDLE"); fi
           python3 scripts/rewrite_ids.py "${args[@]}"
+          echo "--- after rewrite ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist"
 
       - name: Build dylib
         env:
@@ -254,10 +269,12 @@ jobs:
       - name: Inject load command
         run: |
           cp work/TerminalSBX.dylib "$APP/"
-          if python3 scripts/inject_dylib.py "$APP/Terminal" \
+          BIN="$APP/$EXEC"
+          echo "target binary: $BIN"
+          if python3 scripts/inject_dylib.py "$BIN" \
                @executable_path/TerminalSBX.dylib 2>/dev/null; then
             echo "injected with inject_dylib.py"
-          elif python3 scripts/inject_dylib.py --binary "$APP/Terminal" \
+          elif python3 scripts/inject_dylib.py --binary "$BIN" \
                --dylib @executable_path/TerminalSBX.dylib; then
             echo "injected with inject_dylib.py (flag form)"
           else
@@ -265,23 +282,23 @@ jobs:
               https://github.com/tyilo/insert_dylib/releases/latest/download/insert_dylib
             chmod +x /tmp/insert_dylib
             /tmp/insert_dylib --inplace --weak \
-              @executable_path/TerminalSBX.dylib "$APP/Terminal"
+              @executable_path/TerminalSBX.dylib "$BIN"
             echo "injected with insert_dylib"
           fi
-          otool -L "$APP/Terminal" | grep -qi terminalsbx \
+          otool -L "$BIN" | grep -qi terminalsbx \
             || { echo "::error::dylib not in load commands"; exit 1; }
 
       - name: Patch app
         run: |
-          /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Terminal' "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Set :CFBundleName Terminal' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :AppGroupIdentifier $APP_GROUP_ID" \
             "$APP/Info.plist" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Add :AppGroupIdentifier string $APP_GROUP_ID" \
               "$APP/Info.plist"
-          echo "group in plist: $(/usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist")"
+          echo "bundle: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          echo "group : $(/usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist")"
           grep -qF "$APP_GROUP_ID" scripts/ent.plist \
             || echo "::warning::ent.plist group does not match $APP_GROUP_ID"
 
