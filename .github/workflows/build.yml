@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct URL to the a-Shell 2.3.2 IPA (overrides secret/variable)"
-        required: false
+        description: "Direct URL to the a-Shell 2.3.2 IPA (overrides secret/variable/default)"
+        required: true
         type: string
   push:
     branches: [main]
@@ -27,11 +27,14 @@ env:
   TEAM_ID: ${{ secrets.TEAM_ID }}
   OLD_GROUP: ${{ secrets.OLD_GROUP }}
   OLD_BUNDLE: ${{ secrets.OLD_BUNDLE }}
+  # Last-resort URL so a dispatch with an empty box still builds.
+  # Pin this to the exact 2.3.2 asset if "latest" ever drifts.
+  DEFAULT_IPA_URL: "https://github.com/holzschu/a-shell/releases/latest/download/a-shell.ipa"
 
 jobs:
   build:
     # macos-latest resolves unconditionally; cross-compiling to arm64 works
-    # from the x86_64 image.  The old label needed a registered larger runner.
+    # from the x86_64 image.  The old arm64 label needed a registered runner.
     runs-on: macos-latest
     timeout-minutes: 45
 
@@ -57,30 +60,45 @@ jobs:
           INPUT_URL: ${{ inputs.ipa_url }}
           SECRET_URL: ${{ secrets.ASHELL_IPA_URL }}
           VARIABLE_URL: ${{ vars.ASHELL_IPA_URL }}
+          DEFAULT_URL: ${{ env.DEFAULT_IPA_URL }}
         run: |
-          echo "input   : ${INPUT_URL:+present}"
-          echo "secret  : ${SECRET_URL:+present}"
-          echo "variable: ${VARIABLE_URL:+present}"
+          show() {
+            if [ -n "$2" ]; then echo "$1: set"; else echo "$1: unset"; fi
+          }
+          show "input"    "${INPUT_URL:-}"
+          show "secret"   "${SECRET_URL:-}"
+          show "variable" "${VARIABLE_URL:-}"
+          show "default"  "${DEFAULT_URL:-}"
 
-          url="${INPUT_URL:-}"
-          [ -n "$url" ] || url="${SECRET_URL:-}"
-          [ -n "$url" ] || url="${VARIABLE_URL:-}"
+          url=""
+          src=""
+          if [ -n "${INPUT_URL:-}" ]; then
+            url="$INPUT_URL"; src="dispatch input"
+          elif [ -n "${SECRET_URL:-}" ]; then
+            url="$SECRET_URL"; src="secret"
+          elif [ -n "${VARIABLE_URL:-}" ]; then
+            url="$VARIABLE_URL"; src="variable"
+          elif [ -n "${DEFAULT_URL:-}" ]; then
+            url="$DEFAULT_URL"; src="built-in default"
+          fi
 
           if [ -z "$url" ]; then
-            echo "::error::no IPA URL. Set the ASHELL_IPA_URL secret (Settings >"
-            echo "::error::Secrets and variables > Actions), or dispatch with the"
-            echo "::error::ipa_url input filled in."
+            echo "::error::No IPA URL from input, secret, variable, or default."
             exit 1
           fi
+          echo "source: $src"
 
           case "$url" in
             http://*|https://*) ;;
-            *) echo "::error::URL must start with http:// or https:// (got: $url)"; exit 1 ;;
+            *)
+              echo "::error::URL must start with http:// or https:// (got: $url)"
+              exit 1
+              ;;
           esac
 
           case "$url" in
             *drive.google.com*|*dropbox.com/s/*)
-              echo "::warning::looks like a share link, not a direct download;"
+              echo "::warning::looks like a share link, not a direct download"
               echo "::warning::Drive needs /uc?export=download&id=..., Dropbox needs ?dl=1"
               ;;
           esac
@@ -93,8 +111,11 @@ jobs:
           IPA_URL: ${{ steps.source.outputs.url }}
         run: |
           mkdir -p work
-          curl -fL --retry 3 --retry-delay 2 --max-time 300 \
-            -o work/ashell.ipa "$IPA_URL"
+          if ! curl -fL --retry 3 --retry-delay 2 --max-time 300 \
+               -o work/ashell.ipa "$IPA_URL"; then
+            echo "::error::download failed (404, auth wall, or bad link)"
+            exit 1
+          fi
 
           echo "size: $(wc -c < work/ashell.ipa) bytes"
           echo "type: $(file -b work/ashell.ipa)"
