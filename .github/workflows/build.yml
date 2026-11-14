@@ -1,39 +1,170 @@
-name: Build Terminal_worse IPA
+name: Build
 
 on:
   push:
-    branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-    
+    timeout-minutes: 40
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Build for iOS
-      run: |
-        xcodebuild \
-          -project Terminal_worse.xcodeproj \
-          -scheme Terminal_worse \
-          -configuration Release \
-          -destination 'generic/platform=iOS' \
-          -derivedDataPath DerivedData \
-          CODE_SIGN_IDENTITY="" \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGNING_ALLOWED=NO \
-          build
-    
-    - name: Create IPA
-      run: |
-        APP=$(find DerivedData -name "*.app" -type d | head -1)
-        mkdir -p Payload
-        cp -r "$APP" Payload/
-        zip -r Terminal_worse.ipa Payload/
-    
-    - name: Upload IPA
-      uses: actions/upload-artifact@v4
-      with:
-        name: Terminal_worse-ipa
-        path: Terminal_worse.ipa
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)"
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Preflight
+        run: |
+          echo "--- tree ---"
+          find . -maxdepth 2 -not -path './.git/*' | sort | head -n60
+          echo "--- project files ---"
+          find . -name '*.xcodeproj' -o -name 'Package.swift' | head
+          echo "--- dylib source ---"
+          ls -l src/TerminalSBX.m || echo "MISSING src/TerminalSBX.m"
+          echo "--- includes in source ---"
+          grep -nE '^#(import|include)' src/TerminalSBX.m || true
+          echo "--- input IPA ---"
+          ls -l work/*.ipa a-Shell*.ipa *.ipa 2>/dev/null || echo "no IPA in repo"
+          echo "--- scripts present ---"
+          ls -1 scripts 2>/dev/null || true
+
+      - name: Build dylib
+        run: |
+          chmod +x scripts/*.sh 2>/dev/null || true
+          sh scripts/build_dylib_ci.sh
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: TerminalSBX-dylib
+          path: out/TerminalSBX.dylib
+          if-no-files-found: error
+
+  ipa:
+    needs: build
+    if: ${{ vars.HAS_IPA == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)"
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE"
+
+      - name: Fetch input IPA
+        run: |
+          mkdir -p work
+          if [ -f work/a-Shell_2.3.2.ipa ]; then
+            echo "using committed IPA"
+          elif [ -n "${{ secrets.IPA_URL }}" ]; then
+            curl -fL --retry 3 -o work/a-Shell_2.3.2.ipa "${{ secrets.IPA_URL }}"
+          else
+            echo "no IPA available"; exit 1
+          fi
+          ls -l work/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: TerminalSBX-dylib
+          path: out
+
+      - name: Import signing identity
+        env:
+          CERT: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          CERT_PW: ${{ secrets.P12_PASSWORD }}
+          PROFILE: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="$(openssl rand -hex 16)"
+          echo "$CERT" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$RUNNER_TEMP/profile.mobileprovision" \
+            ~/Library/MobileDevice/Provisioning\ Profiles/
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Patch app
+        run: |
+          set -euo pipefail
+          rm -rf work/extract && mkdir -p work/extract
+          unzip -q work/a-Shell_2.3.2.ipa -d work/extract
+          APP="$(find work/extract/Payload -maxdepth 1 -name '*.app' | head -n1)"
+          [ -n "$APP" ] || { echo "no .app in IPA"; exit 1; }
+          echo "app: $APP"
+
+          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          mv "$APP/$EXEC" "$APP/Terminal"
+          for k in CFBundleExecutable CFBundleName CFBundleDisplayName CFBundleIdentifier; do :; done
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.apple.Terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleName Terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :AppGroupIdentifier ${{ secrets.APP_GROUP_ID }}" \
+            "$APP/Info.plist" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :AppGroupIdentifier string ${{ secrets.APP_GROUP_ID }}" \
+              "$APP/Info.plist"
+
+          mkdir -p "$APP/Frameworks"
+          cp out/TerminalSBX.dylib "$APP/Frameworks/"
+          [ -d env ] && mkdir -p "$APP/bin" && cp env/* "$APP/bin/"
+          if [ -f icon/out/Assets.car ]; then
+            cp icon/out/Assets.car "$APP/"
+            cp icon/out/DisplayIcon*.png "$APP/" 2>/dev/null || true
+          fi
+
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$APP/embedded.mobileprovision" 2>/dev/null || true
+
+      - name: Inject LC_LOAD_DYLIB
+        run: |
+          set -euo pipefail
+          pip install --quiet lief
+          APP="$(find work/extract/Payload -maxdepth 1 -name '*.app' | head -n1)"
+          python3 scripts/inject_dylib.py "$APP/Terminal" \
+            @executable_path/Frameworks/TerminalSBX.dylib
+          otool -L "$APP/Terminal" | grep -i terminalSBX && echo "injection confirmed"
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          APP="$(find work/extract/Payload -maxdepth 1 -name '*.app' | head -n1)"
+          ID="$(security find-identity -v -p codesigning | head -n1 | sed 's/.*"\(.*\)"/\1/')"
+          echo "identity: $ID"
+          find "$APP" -name '*.dylib' -o -name '*.framework' -type d | while read -r f; do
+            codesign -f -s "$ID" --timestamp=none "$f"
+          done
+          codesign -f -s "$ID" --entitlements scripts/ent.plist \
+            --generate-entitlement-der "$APP"
+          codesign -vvv "$APP"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd work/extract
+          rm -rf Payload/__MACOSX
+          zip -qry ../Terminal_worse.ipa Payload
+          cd ../..
+          ls -l work/Terminal_worse.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Terminal_worse-ipa
+          path: work/Terminal_worse.ipa
+          if-no-files-found: error
