@@ -4,13 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct URL to an .ipa or .zip (blank = ipa/ folder, then auto-discover)"
+        description: "Direct URL to an .ipa/.zip/.tar.gz (blank = ipa/ folder, then own release)"
         required: false
         type: string
-      tag:
-        description: "Release tag to inspect (blank = newest)"
+      source_repo:
+        description: "owner/repo to discover from, after your own release"
         required: false
-        default: "2.3.2"
+        default: "holzschu/a-shell"
+        type: string
+      tag:
+        description: "Release tag (blank = newest)"
+        required: false
+        default: ""
         type: string
   push:
     branches: [main]
@@ -28,19 +33,17 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  WORKFLOW_REV: "7"
   APP_GROUP_ID: ${{ secrets.APP_GROUP_ID || 'group.com.jasonquiles.terminal' }}
   BUNDLE_ID: ${{ secrets.BUNDLE_ID || 'com.jasonquiles.terminal' }}
   TEAM_ID: ${{ secrets.TEAM_ID }}
   OLD_GROUP: ${{ secrets.OLD_GROUP }}
   OLD_BUNDLE: ${{ secrets.OLD_BUNDLE }}
-  UPSTREAM_REPO: "holzschu/a-shell"
 
 jobs:
   build:
-    # macos-latest resolves unconditionally; cross-compiling to arm64 works
-    # from the x86_64 image.  The old arm64 label needed a registered runner.
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -48,56 +51,53 @@ jobs:
 
       - name: Report runner
         run: |
+          echo "rev   : $WORKFLOW_REV   (must be 7)"
           echo "arch  : $(uname -m)"
           echo "xcode : $(xcodebuild -version | head -1)"
           echo "sha   : $GITHUB_SHA"
-          echo "ref   : $GITHUB_REF"
+          echo "event : $GITHUB_EVENT_NAME"
+          echo "repo  : $GITHUB_REPOSITORY"
 
       - name: Install toolchain
         run: |
           brew install ldid xz coreutils jq
           echo "clang: $(clang --version | head -1)"
-          echo "jq   : $(jq --version)"
 
       - name: Resolve IPA source
         id: source
         env:
           INPUT_URL: ${{ inputs.ipa_url }}
+          OWN_REPO: ${{ github.repository }}
+          SRC_REPO: ${{ inputs.source_repo || 'holzschu/a-shell' }}
           TAG: ${{ inputs.tag }}
           SECRET_URL: ${{ secrets.ASHELL_IPA_URL }}
           VARIABLE_URL: ${{ vars.ASHELL_IPA_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          show() { if [ -n "$2" ]; then echo "$1: set"; else echo "$1: unset"; fi; }
-          show "input"    "${INPUT_URL:-}"
-          show "secret"   "${SECRET_URL:-}"
-          show "variable" "${VARIABLE_URL:-}"
-          echo  "tag     : ${TAG:-<blank>}"
+          echo "rev     : $WORKFLOW_REV (must be 7)"
+          echo "own repo: $OWN_REPO"
+          echo "tag     : ${TAG:-<blank>}"
 
           emit() { echo "kind=$1" >> "$GITHUB_OUTPUT"; echo "value=$2" >> "$GITHUB_OUTPUT"; }
 
-          # 1-3: explicit configuration always wins
+          # 1: explicit URL
           if [ -n "${INPUT_URL:-}" ]; then emit url "$INPUT_URL"; echo "source: dispatch input"; exit 0; fi
-          if [ -n "${SECRET_URL:-}" ]; then emit url "$SECRET_URL"; echo "source: secret"; exit 0; fi
-          if [ -n "${VARIABLE_URL:-}" ]; then emit url "$VARIABLE_URL"; echo "source: variable"; exit 0; fi
 
-          # 4: a committed .ipa/.zip needs no network at all
-          LOCAL="$(find ipa -maxdepth 2 \( -iname '*.ipa' -o -iname '*.zip' \) -print 2>/dev/null | head -1)"
+          # 2: committed archive
+          LOCAL="$(find ipa -maxdepth 2 \( -iname '*.ipa' -o -iname '*.zip' \
+                   -o -iname '*.tar.gz' -o -iname '*.tgz' \) -print 2>/dev/null | head -1)"
           if [ -n "$LOCAL" ]; then
             emit local "$LOCAL"
             echo "source: repo file $LOCAL"
             exit 0
           fi
 
-          # 5: API, authenticated, with the status kept instead of discarded
-          API="https://api.github.com/repos/$UPSTREAM_REPO/releases"
+          # 3-4: stored config
+          if [ -n "${SECRET_URL:-}" ]; then emit url "$SECRET_URL"; echo "source: secret"; exit 0; fi
+          if [ -n "${VARIABLE_URL:-}" ]; then emit url "$VARIABLE_URL"; echo "source: variable"; exit 0; fi
+
           HDR=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
-          if [ -n "${GH_TOKEN:-}" ]; then
-            HDR+=(-H "Authorization: Bearer $GH_TOKEN")
-            echo "api auth: token (5000/hr)"
-          else
-            echo "api auth: anonymous (60/hr, shared IP)"
-          fi
+          if [ -n "${GH_TOKEN:-}" ]; then HDR+=(-H "Authorization: Bearer $GH_TOKEN"); fi
 
           BODY=""
           STATUS="000"
@@ -105,98 +105,73 @@ jobs:
             local raw
             BODY=""
             STATUS="000"
-            raw="$(curl -sS --max-time 30 -w '\n%{http_code}' "${HDR[@]}" "$API/$1")" || raw=""
-            if [ -z "$raw" ]; then
-              return 0
-            fi
+            raw="$(curl -sS --max-time 30 -w '\n%{http_code}' "${HDR[@]}" "$1")" || raw=""
+            [ -n "$raw" ] || return 0
             STATUS="${raw##*$'\n'}"
             BODY="${raw%$'\n'*}"
-            if [ "$STATUS" != "200" ]; then
-              BODY=""
-            fi
+            [ "$STATUS" = "200" ] || BODY=""
           }
 
-          if [ -n "${TAG:-}" ]; then
-            echo "GET releases/tags/$TAG"
-            fetch "tags/$TAG"
-            echo "  status: $STATUS"
-            if [ "$STATUS" = "404" ]; then
-              echo "  tag does not exist"
+          pick_from() {
+            printf '%s' "$1" | jq -r '.assets[]?.browser_download_url' \
+              | grep -iE "$2" | head -1 || true
+          }
+
+          # 5: own repo first - this is where the release lives
+          echo "GET releases/latest on $OWN_REPO"
+          fetch "https://api.github.com/repos/$OWN_REPO/releases/latest"
+          echo "  status: $STATUS"
+          if [ -n "$BODY" ]; then
+            n="$(printf '%s' "$BODY" | jq -r '.assets | length')"
+            echo "  own assets: $n"
+            if [ "$n" -gt 0 ]; then
+              printf '%s' "$BODY" | jq -r '.assets[] | "    \(.name)  \(.size) bytes"'
             fi
+            url="$(pick_from "$BODY" '\.ipa$')"
+            if [ -z "$url" ]; then url="$(pick_from "$BODY" '\.zip$')"; fi
+            if [ -z "$url" ]; then url="$(pick_from "$BODY" '\.(tar\.gz|tgz)$')"; fi
+            if [ -n "$url" ]; then
+              emit url "$url"
+              echo "source: own release asset"
+              echo "resolved: $url"
+              exit 0
+            fi
+            echo "  own release has no usable asset"
           fi
 
+          # 6: configured / upstream repo
+          echo "GET releases/latest on $SRC_REPO"
+          fetch "https://api.github.com/repos/$SRC_REPO/releases/latest"
+          echo "  status: $STATUS"
           if [ -z "$BODY" ]; then
-            echo "GET releases/latest"
-            fetch "latest"
-            echo "  status: $STATUS"
-          fi
-
-          # 6: HTML asset listing, no API quota consumed
-          if [ -z "$BODY" ]; then
-            echo "::warning::API unusable (last status $STATUS); trying HTML listing"
-            tag_html="${TAG:-}"
-            if [ -z "$tag_html" ]; then
-              loc="$(curl -sS -o /dev/null -w '%{redirect_url}' \
-                     "https://github.com/$UPSTREAM_REPO/releases/latest" || true)"
-              tag_html="${loc##*/}"
-            fi
-            echo "html tag: ${tag_html:-<unknown>}"
-            if [ -n "$tag_html" ] && [ "$tag_html" != "latest" ]; then
-              html="$(curl -fsSL --max-time 30 \
-                      "https://github.com/$UPSTREAM_REPO/releases/expanded_assets/$tag_html" 2>/dev/null || true)"
-              if [ -n "$html" ]; then
-                echo "assets on $tag_html (html):"
-                printf '%s' "$html" | grep -oE '/[^"/]+/[^"/]+/releases/download/[^"]+' \
-                  | sort -u | sed 's/^/  /' || true
-                rel="$(printf '%s' "$html" | grep -oE '/[^"]+\.ipa' | head -1 || true)"
-                if [ -n "$rel" ]; then
-                  emit url "https://github.com$rel"
-                  echo "source: html asset"
-                  echo "resolved: https://github.com$rel"
-                  exit 0
-                fi
-              fi
-            fi
-          fi
-
-          if [ -z "$BODY" ]; then
-            echo "::error::no release data from API or HTML (last status $STATUS)"
-            echo "::error::see https://github.com/$UPSTREAM_REPO/releases"
+            echo "::error::no usable release on $OWN_REPO or $SRC_REPO"
+            echo "::error::publish the release (not draft, not pre-release) or commit under ipa/"
             exit 1
           fi
 
-          tag_name="$(printf '%s' "$BODY" | jq -r '.tag_name // "?"')"
-          count="$(printf '%s' "$BODY" | jq -r '.assets | length')"
-          echo "release: $tag_name, uploaded assets: $count"
-          if [ "$count" -gt 0 ]; then
+          tn="$(printf '%s' "$BODY" | jq -r '.tag_name // "?"')"
+          cn="$(printf '%s' "$BODY" | jq -r '.assets | length')"
+          echo "release: $tn, assets: $cn"
+          if [ "$cn" -gt 0 ]; then
             printf '%s' "$BODY" | jq -r '.assets[] | "  \(.name)  \(.size) bytes"'
           fi
 
-          if [ "$count" -eq 0 ]; then
-            echo "::error::release $tag_name carries no uploaded assets (source-only tag)"
-            echo "::error::commit an .ipa under ipa/ or paste a direct link"
+          url="$(pick_from "$BODY" '\.ipa$')"
+          if [ -z "$url" ]; then url="$(pick_from "$BODY" '\.zip$' | head -1)"; fi
+          if [ -z "$url" ]; then url="$(pick_from "$BODY" '\.(tar\.gz|tgz)$')"; fi
+          if [ -z "$url" ]; then
+            echo "::error::no .ipa/.zip/.tar.gz on $SRC_REPO@$tn"
             exit 1
           fi
-
-          url="$(printf '%s' "$BODY" | jq -r '.assets[]?.browser_download_url' \
-                 | grep -iE '\.ipa$' | head -1 || true)"
-          if [ -z "$url" ]; then
-            url="$(printf '%s' "$BODY" | jq -r '.assets[]?.browser_download_url' \
-                   | grep -iE '\.zip$' | grep -viE 'source|src' | head -1 || true)"
-          fi
-          if [ -z "$url" ]; then
-            echo "::error::no .ipa and no usable .zip among the assets listed above"
-            exit 1
-          fi
-
           emit url "$url"
-          echo "source: discovered asset"
+          echo "source: $SRC_REPO asset"
           echo "resolved: $url"
 
       - name: Fetch and unpack IPA
         env:
           KIND: ${{ steps.source.outputs.kind }}
           VALUE: ${{ steps.source.outputs.value }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p work
           if [ "$KIND" = "local" ]; then
@@ -207,49 +182,57 @@ jobs:
               http://*|https://*) ;;
               *) echo "::error::URL must start with http:// or https:// (got: $VALUE)"; exit 1 ;;
             esac
+
+            AUTH=()
             case "$VALUE" in
-              *drive.google.com*|*dropbox.com/s/*)
-                echo "::warning::share link, not a direct download"
-                echo "::warning::Drive needs /uc?export=download&id=..., Dropbox needs ?dl=1"
+              *github.com/*|*githubusercontent.com/*)
+                if [ -n "${GH_TOKEN:-}" ]; then
+                  AUTH=(-H "Authorization: Bearer $GH_TOKEN")
+                  echo "auth: token"
+                fi
                 ;;
             esac
-            if ! curl -fL --retry 3 --retry-delay 2 --max-time 300 -o work/incoming "$VALUE"; then
-              echo "::error::download failed (404, auth wall, or bad link)"
+
+            if ! curl -fL --location-trusted --retry 3 --retry-delay 2 \
+                 --max-time 900 "${AUTH[@]}" -o work/incoming "$VALUE"; then
+              echo "::error::download failed"
               echo "::error::url was: $VALUE"
               exit 1
             fi
           fi
 
           echo "size: $(wc -c < work/incoming) bytes"
-          echo "type: $(file -b work/incoming)"
+          ftype="$(file -b work/incoming)"
+          echo "type: $ftype"
 
-          if unzip -tq work/incoming >/dev/null 2>&1; then
-            unzip -q work/incoming -d work/unpacked
-          else
-            echo "::error::not a valid zip/ipa; content-type was probably HTML"
-            head -c 300 work/incoming
-            exit 1
-          fi
+          mkdir -p work/unpacked
+          case "$ftype" in
+            *Zip*) unzip -q work/incoming -d work/unpacked ;;
+            *gzip*|*tar*) tar -xzf work/incoming -C work/unpacked ;;
+            *)
+              echo "::error::unrecognised archive type: $ftype"
+              head -c 300 work/incoming
+              exit 1
+              ;;
+          esac
 
           if [ ! -d work/unpacked/Payload ]; then
-            inner="$(find work/unpacked -maxdepth 3 -iname '*.ipa' -print -quit)"
-            if [ -z "$inner" ]; then
-              echo "::error::no Payload/ in archive and no nested .ipa"
-              find work/unpacked -maxdepth 3
-              exit 1
+            inner="$(find work/unpacked -maxdepth 4 \( -iname '*.ipa' -o -iname '*.zip' \) -print -quit)"
+            if [ -n "$inner" ]; then
+              echo "nested archive: $inner"
+              unzip -q "$inner" -d work/unpacked2
+              rm -rf work/unpacked
+              mv work/unpacked2 work/unpacked
             fi
-            echo "nested ipa: $inner"
-            unzip -q "$inner" -d work/unpacked2
-            rm -rf work/unpacked
-            mv work/unpacked2 work/unpacked
           fi
 
-          APP="$(find work/unpacked/Payload -maxdepth 1 -name '*.app' -print -quit)"
+          APP="$(find work/unpacked -maxdepth 6 -name '*.app' -print -quit)"
           if [ -z "$APP" ]; then
-            echo "::error::Payload has no .app"
-            find work/unpacked -maxdepth 3
+            echo "::error::no .app inside the archive"
+            ls -A work/unpacked | head -30
             exit 1
           fi
+          echo "app: $APP"
           mv "$APP" work/Terminal.app
           echo "APP=work/Terminal.app" >> "$GITHUB_ENV"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' work/Terminal.app/Info.plist
