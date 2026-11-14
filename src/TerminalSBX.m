@@ -43,6 +43,22 @@
 #include <xpc/xpc.h>
 
 // ---------------------------------------------------------------------------
+// Identity
+//
+// This must byte-match AppGroupIdentifier in Info.plist and the
+// com.apple.security.application-groups array in scripts/ent.plist.  If it
+// does not, containerURLForSecurityApplicationGroupIdentifier returns nil for
+// every candidate, worse_query returns -1 before it reaches containermanager,
+// and only the weaker class-13 fallback survives.
+//
+// Override at build time with -DSBX_APP_GROUP='"group.yours"'.
+// ---------------------------------------------------------------------------
+
+#ifndef SBX_APP_GROUP
+#define SBX_APP_GROUP "group.com.jasonquiles.terminal"
+#endif
+
+// ---------------------------------------------------------------------------
 // Output streams
 // ---------------------------------------------------------------------------
 
@@ -519,13 +535,11 @@ static void sbx_resolve_group(void) {
     for (NSString *g in sbx_groups_from_entitlements()) add(g);
     for (NSString *g in sbx_groups_from_profile()) add(g);
 
-    // Groups provisioned for the signing identity used by this workspace.
-    add(@"group.com.cert.account.t260930000125.01");
-    add(@"group.com.cert.account.t260930000125.02");
-    add(@"group.com.cert.account.t260930000125.03");
-    add(@"group.com.cert.account.t260930000125.04");
-    add(@"group.com.cert.account.t260930000125.05");
-    add(@"group.AsheKube.a-Shell");
+    // Compiled-in fallback.  Keep in sync with SBX_APP_GROUP, Info.plist and
+    // scripts/ent.plist.  containerURLForSecurityApplicationGroupIdentifier
+    // returns nil for anything the profile does not actually carry, and the
+    // loop below just skips it.
+    add(@SBX_APP_GROUP);
 
     NSFileManager *fm = [NSFileManager defaultManager];
     // The group container is sometimes not visible during the first few
@@ -1244,7 +1258,7 @@ static void sbx_automount(BOOL showUI) {
         // the scan, but no extension is needed for it.
         NSString *ownRoot = NSHomeDirectory();
         NSString *ownBid = [[NSBundle mainBundle] bundleIdentifier];
-        if (ownBid.length == 0) ownBid = @"com.apple.Terminal";
+        if (ownBid.length == 0) ownBid = @SBX_APP_GROUP_BUNDLE_ID;
         NSString *appsDest = [mountRoot stringByAppendingPathComponent:@"apps"];
         [fm createDirectoryAtPath:appsDest withIntermediateDirectories:YES attributes:nil error:NULL];
         NSString *ownDest = [appsDest stringByAppendingPathComponent:sbx_safe_name(ownBid)];
