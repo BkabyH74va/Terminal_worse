@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-Rewrite the previous build's bundle id and app-group id to yours.
+Rewrite the bundle id and app-group id inside an .app.
 
-All of these must agree or worse_query bails at -1 before it reaches
-containermanager:
-
-  * Info.plist, commandDictionary.plist, any other bundle plist
-  * .com.apple.mobile_container_manager.metadata.plist inside containers
-  * Mach-O string tables
+Old values are read from the app itself unless --old-* / OLD_* are given,
+so no configuration is required.  New values are forced in unconditionally:
+a key that exists is overwritten, a key that is missing is added.
 
 Plists are rewritten structurally.  Mach-O files get a byte-level replace
 that only fires when the new string fits the old slot; the remainder is
 NUL-padded so no offsets move.  A too-long replacement warns instead of
 truncating.
-
-Source values: --old-* or OLD_GROUP / OLD_BUNDLE.
-Destination values: --new-* or NEW_GROUP / NEW_BUNDLE, defaulting to
-group.com.jasonquiles.terminal and com.jasonquiles.terminal.
-
-Re-running is safe: migrated files no longer match and are skipped.
 """
 
 import argparse
@@ -28,7 +19,7 @@ import shutil
 import sys
 
 DEFAULT_NEW_GROUP = "group.com.jasonquiles.terminal"
-DEFAULT_NEW_BUNDLE = "com.jasonquiles.terminal"
+DEFAULT_NEW_BUNDLE = "com.jq.terminal"
 
 BUNDLE_KEYS = ("CFBundleIdentifier", "AppGroupIdentifier", "WKAppBundleIdentifier")
 ENTITLEMENT_BUNDLE_KEYS = ("application-identifier",)
@@ -56,6 +47,16 @@ def is_macho(path):
         return False
 
 
+def read_key(plist_path, key):
+    try:
+        with open(plist_path, "rb") as handle:
+            plist = plistlib.load(handle)
+    except Exception:  # noqa: BLE001
+        return ""
+    value = plist.get(key) if isinstance(plist, dict) else None
+    return value if isinstance(value, str) else ""
+
+
 def patch_macho(path, old, new):
     if not old or not new or old == new:
         return 0
@@ -70,11 +71,12 @@ def patch_macho(path, old, new):
     if old_bytes not in data:
         return 0
     if len(new_bytes) > len(old_bytes):
-        warn(f"{path}: '{old}' -> '{new}' too long ({len(new_bytes)} > "
-             f"{len(old_bytes)}), skipped")
+        warn(f"{path}: '{old}' -> '{new}' too long "
+             f"({len(new_bytes)} > {len(old_bytes)}), skipped")
         return 0
     count = data.count(old_bytes)
-    data = data.replace(old_bytes, new_bytes + b"\x00" * (len(old_bytes) - len(new_bytes)))
+    data = data.replace(old_bytes,
+                        new_bytes + b"\x00" * (len(old_bytes) - len(new_bytes)))
     try:
         with open(path, "wb") as handle:
             handle.write(data)
@@ -85,7 +87,7 @@ def patch_macho(path, old, new):
     return count
 
 
-def rewrite_plist(path, old_group, new_group, old_bundle, new_bundle):
+def rewrite_plist(path, old_group, new_group, old_bundle, new_bundle, force):
     try:
         with open(path, "rb") as handle:
             plist = plistlib.load(handle)
@@ -96,32 +98,42 @@ def rewrite_plist(path, old_group, new_group, old_bundle, new_bundle):
         return 0
 
     edits = 0
-    for key in BUNDLE_KEYS:
-        value = plist.get(key)
-        if isinstance(value, str) and old_bundle and value == old_bundle:
-            plist[key] = new_bundle
+
+    def put(key, new_value, old_value):
+        nonlocal edits
+        current = plist.get(key)
+        if force:
+            if current != new_value:
+                plist[key] = new_value
+                edits += 1
+            return
+        if isinstance(current, str) and old_value and current == old_value:
+            plist[key] = new_value
             edits += 1
 
+    for key in BUNDLE_KEYS:
+        put(key, new_bundle, old_bundle)
     for key in GROUP_KEYS:
-        value = plist.get(key)
-        if isinstance(value, str) and old_group and value == old_group:
-            plist[key] = new_group
-            edits += 1
+        put(key, new_group, old_group)
 
     for key in ENTITLEMENT_GROUP_KEYS:
         groups = plist.get(key)
-        if isinstance(groups, list):
-            rebuilt = []
-            for entry in groups:
-                if isinstance(entry, str) and old_group and entry == old_group:
+        if not isinstance(groups, list):
+            continue
+        rebuilt = []
+        for entry in groups:
+            if isinstance(entry, str) and entry == old_group:
+                if new_group not in rebuilt:
                     rebuilt.append(new_group)
                     edits += 1
-                elif entry not in rebuilt:
-                    rebuilt.append(entry)
-            if new_group not in rebuilt:
-                rebuilt.append(new_group)
-                edits += 1
+            elif entry not in rebuilt:
+                rebuilt.append(entry)
+        if force and new_group not in rebuilt:
+            rebuilt.append(new_group)
+            edits += 1
+        if rebuilt != groups:
             plist[key] = rebuilt
+            edits += 1
 
     for key in ENTITLEMENT_BUNDLE_KEYS:
         value = plist.get(key)
@@ -151,13 +163,11 @@ def walk(app, old_group, new_group, old_bundle, new_bundle):
             path = os.path.join(root, name)
             if name.endswith(".plist"):
                 plist_edits += rewrite_plist(path, old_group, new_group,
-                                             old_bundle, new_bundle)
+                                             old_bundle, new_bundle, True)
                 continue
             if is_macho(path):
-                if old_bundle:
-                    binary_edits += patch_macho(path, old_bundle, new_bundle)
-                if old_group:
-                    binary_edits += patch_macho(path, old_group, new_group)
+                binary_edits += patch_macho(path, old_bundle, new_bundle)
+                binary_edits += patch_macho(path, old_group, new_group)
     return plist_edits, binary_edits
 
 
@@ -174,29 +184,41 @@ def main():
     args = parser.parse_args()
 
     app = os.path.abspath(args.app)
+    info = os.path.join(app, "Info.plist")
     if not os.path.isdir(app):
         print(f"error: {app} is not a directory", file=sys.stderr)
         return 2
-    if not os.path.isfile(os.path.join(app, "Info.plist")):
-        print(f"error: {app}/Info.plist missing", file=sys.stderr)
+    if not os.path.isfile(info):
+        print(f"error: {info} missing", file=sys.stderr)
         return 2
 
-    old_group, new_group = args.old_group.strip(), args.new_group.strip()
-    old_bundle, new_bundle = args.old_bundle.strip(), args.new_bundle.strip()
+    new_group, new_bundle = args.new_group.strip(), args.new_bundle.strip()
+    if not new_group or not new_bundle:
+        print("error: --new-bundle and --new-group are required", file=sys.stderr)
+        return 2
 
-    if not old_group and not old_bundle:
-        print("error: nothing to rewrite", file=sys.stderr)
-        return 2
-    if old_group and old_group == new_group:
-        print(f"error: old group equals new group ({new_group})", file=sys.stderr)
-        return 2
+    old_bundle = args.old_bundle.strip()
+    old_group = args.old_group.strip()
+
+    # Auto-detect when not supplied: the app already knows its own identity.
+    if not old_bundle:
+        old_bundle = read_key(info, "CFBundleIdentifier")
+        if old_bundle:
+            print(f"detected bundle id: {old_bundle}")
+    if not old_group:
+        old_group = read_key(info, "AppGroupIdentifier")
+        if old_group:
+            print(f"detected app group: {old_group}")
+
     if old_bundle and old_bundle == new_bundle:
-        print(f"error: old bundle equals new bundle ({new_bundle})", file=sys.stderr)
-        return 2
+        print("bundle id already matches")
+    if old_bundle and len(new_bundle) > len(old_bundle):
+        print(f"note: new bundle id is {len(new_bundle)} chars, old is "
+              f"{len(old_bundle)}; Mach-O patch will be skipped, plist still rewritten")
 
     print(f"app       : {app}")
-    print(f"bundle id : {old_bundle or '(unchanged)'} -> {new_bundle}")
-    print(f"app group : {old_group or '(unchanged)'} -> {new_group}")
+    print(f"bundle id : {old_bundle or '(none)'} -> {new_bundle}")
+    print(f"app group : {old_group or '(none)'} -> {new_group}")
 
     if not args.dry_run:
         backup = app.rstrip("/") + ".orig"
@@ -208,8 +230,9 @@ def main():
     print(f"\nplist keys : {plist_edits}\nbinary hits: {binary_edits}")
     for entry in changed:
         print(f"  {entry}")
-    if plist_edits == 0 and binary_edits == 0:
-        print("nothing matched; wrong --old-* or already migrated")
+    if plist_edits == 0:
+        print("error: no plist key changed", file=sys.stderr)
+        return 1
     return 0
 
 
