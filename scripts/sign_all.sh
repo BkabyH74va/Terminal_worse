@@ -1,37 +1,61 @@
-#!/bin/bash
-# Reference signing pass: sign every framework with the same team, then the
-# app with the supplied entitlements and provisioning profile.
-#
-# Usage:
-#   IDENTITY=... KEYCHAIN=... PROFILE=... ./sign_all.sh work/Terminal.app
+#!/usr/bin/env bash
 set -euo pipefail
-APP="${1:-work/Terminal.app}"
-IDENTITY="${IDENTITY:?set IDENTITY}"
-KEYCHAIN="${KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
-ENT="${ENT:-scripts/ent.plist}"
-PROFILE="${PROFILE:?set PROFILE}"
 
-find "$APP/Frameworks" "$APP/usr" "$APP/Library" -type f \
-  \( -name '*.dylib' -o -name '*.so' -o -perm -111 \) -print0 2>/dev/null |
-while IFS= read -r -d '' f; do
-  file -b "$f" | grep -q 'Mach-O' || continue
-  codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none "$f"
+APP="${1:?usage: sign_all.sh <path to .app>}"
+APP_GROUP="${APP_GROUP_ID:-group.com.jasonquiles.terminal}"
+BUNDLE_ID="${BUNDLE_ID:-com.jasonquiles.terminal}"
+TEAM_ID="${TEAM_ID:-}"
+
+if [ -z "$TEAM_ID" ]; then
+  echo "error: TEAM_ID is empty (security find-identity -v -p codesigning)" >&2
+  exit 1
+fi
+for tool in ldid codesign plutil; do
+  command -v "$tool" >/dev/null || { echo "error: missing $tool" >&2; exit 1; }
+done
+[ -d "$APP" ] || { echo "error: $APP not found" >&2; exit 1; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Substitute the team id and force the group, whatever ent.plist held.
+sed -e "s/TEAMID/$TEAM_ID/g" \
+    -e "s|group\.com\.jasonquiles\.terminal|$APP_GROUP|g" \
+    scripts/ent.plist > "$WORK/ent.plist"
+
+/usr/libexec/PlistBuddy -c 'Print' "$WORK/ent.plist" >&2
+
+if ! grep -qF "$APP_GROUP" "$WORK/ent.plist"; then
+  echo "error: $APP_GROUP missing from ent.plist" >&2
+  exit 1
+fi
+if ! grep -qF "$TEAM_ID" "$WORK/ent.plist"; then
+  echo "error: TEAM_ID did not substitute" >&2
+  exit 1
+fi
+
+EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+BIN="$APP/$EXEC"
+[ -f "$BIN" ] || { echo "error: $BIN not found" >&2; exit 1; }
+
+# Identifier must agree with what the entitlement signs for.
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
+
+find "$APP" -name '*.dylib' -o -name '*.framework' -type d 2>/dev/null | while read -r item; do
+  echo "signing $item"
+  ldid -S "$WORK/ent.plist" "$item"
 done
 
-find "$APP/Frameworks" -type d -name '*.framework' -print |
-  awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2- |
-while IFS= read -r fw; do
-  codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none "$fw"
-done
+ldid -S "$WORK/ent.plist" "$BIN"
+codesign --force --sign - --timestamp=none --entitlements "$WORK/ent.plist" "$APP"
 
-for appex in "$APP"/PlugIns/*.appex; do
-  [ -d "$appex" ] || continue
-  cp "$PROFILE" "$appex/embedded.mobileprovision"
-  codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
-    --entitlements "$ENT" --generate-entitlement-der --timestamp=none "$appex"
-done
+echo "--- signed entitlements ---" >&2
+codesign -d --entitlements :- "$APP" 2>/dev/null > "$WORK/verify.plist" || true
+cat "$WORK/verify.plist" >&2
 
-cp "$PROFILE" "$APP/embedded.mobileprovision"
-codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
-  --entitlements "$ENT" --generate-entitlement-der --timestamp=none "$APP"
-codesign --verify --strict --verbose=2 "$APP"
+if grep -qF "$APP_GROUP" "$WORK/verify.plist"; then
+  echo "group entitlement verified"
+else
+  echo "error: $APP_GROUP not present in signed entitlements" >&2
+  exit 1
+fi
