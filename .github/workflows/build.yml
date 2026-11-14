@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WORKFLOW_REV: "9"
+  WORKFLOW_REV: "10"
   FALLBACK_BUNDLE_ID: "com.jq.terminal"
   FALLBACK_GROUP_ID: "group.com.jasonquiles.terminal"
   WANT_BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
@@ -54,13 +54,14 @@ jobs:
 
       - name: Report runner
         run: |
-          echo "rev   : $WORKFLOW_REV   (must be 9)"
+          echo "rev   : $WORKFLOW_REV   (must be 10)"
           echo "arch  : $(uname -m)"
           echo "sha   : $GITHUB_SHA"
           echo "event : $GITHUB_EVENT_NAME"
           echo "repo  : $GITHUB_REPOSITORY"
           echo "want bundle: ${WANT_BUNDLE_ID:-<unset>}"
           echo "want group : ${WANT_GROUP_ID:-<unset>}"
+          echo "team       : ${TEAM_ID:-<unset>}"
 
       - name: Install toolchain
         run: |
@@ -78,7 +79,7 @@ jobs:
           VARIABLE_URL: ${{ vars.ASHELL_IPA_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "rev     : $WORKFLOW_REV (must be 9)"
+          echo "rev     : $WORKFLOW_REV (must be 10)"
           echo "own repo: $OWN_REPO"
 
           emit() { echo "kind=$1" >> "$GITHUB_OUTPUT"; echo "value=$2" >> "$GITHUB_OUTPUT"; }
@@ -256,86 +257,124 @@ jobs:
           echo "--- current identity ---"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
           /usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist" 2>/dev/null || echo "(no AppGroupIdentifier)"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist" || true
 
       - name: Resolve identity from profile
         run: |
           set -euo pipefail
           APP="$APP"
-
-          # a profile committed at sign/profile.mobileprovision overrides the payload's
-          if [ -f sign/profile.mobileprovision ]; then
-            echo "using sign/profile.mobileprovision"
-            cp sign/profile.mobileprovision "$APP/embedded.mobileprovision"
-          fi
-
           PROF="$APP/embedded.mobileprovision"
-          p_team=""
-          p_bundle=""
-          p_group=""
 
-          if [ -f "$PROF" ]; then
-            echo "profile: present"
-            if security cms -D -i "$PROF" > work/prof.plist 2>/dev/null; then
-              p_team="$(plutil -extract TeamIdentifier.0 raw -o - work/prof.plist 2>/dev/null || true)"
-              p_bundle="$(plutil -extract Entitlements.application-identifier raw -o - work/prof.plist 2>/dev/null || true)"
-              p_bundle="${p_bundle#*.}"
-              p_group="$(plutil -extract Entitlements.com.apple.security.application-groups json -o - work/prof.plist 2>/dev/null | jq -r '.[0] // empty' || true)"
-              echo "profile team  : ${p_team:-<none>}"
-              echo "profile bundle: ${p_bundle:-<none>}"
-              echo "profile group : ${p_group:-<none>}"
-            else
-              echo "::warning::profile present but undecodable"
-            fi
-          else
-            echo "::warning::payload has no embedded.mobileprovision"
+          # a committed profile is authoritative and trusted outright
+          explicit=""
+          if [ -f sign/profile.mobileprovision ]; then
+            echo "using committed sign/profile.mobileprovision"
+            cp sign/profile.mobileprovision "$PROF"
+            explicit=1
           fi
 
-          trusted=""
-          if [ -n "${TEAM_ID:-}" ] && [ -n "$p_team" ] && [ "$p_team" = "$TEAM_ID" ]; then
-            trusted=1
-            echo "profile team matches TEAM_ID"
-          fi
-
-          bundle="${WANT_BUNDLE_ID:-}"
-          if [ -z "$bundle" ] && [ -n "$trusted" ]; then bundle="$p_bundle"; fi
-          if [ -z "$bundle" ]; then bundle="$FALLBACK_BUNDLE_ID"; fi
-
-          group="${WANT_GROUP_ID:-}"
-          if [ -z "$group" ] && [ -n "$trusted" ]; then group="$p_group"; fi
-          if [ -z "$group" ]; then group="$FALLBACK_GROUP_ID"; fi
-
-          echo "BUNDLE_ID=$bundle" >> "$GITHUB_ENV"
-          echo "APP_GROUP_ID=$group" >> "$GITHUB_ENV"
-          echo "final bundle: $bundle (${#bundle} chars)"
-          echo "final group : $group"
-
-          if [ "${#bundle}" -gt 18 ]; then
-            echo "::warning::$bundle is ${#bundle} chars; Mach-O patch skips above 18"
-          fi
-
-          if [ -z "$p_bundle" ]; then
-            echo "::error::no usable profile in the payload"
+          if [ ! -f "$PROF" ]; then
+            echo "::error::no profile: payload has none and sign/profile.mobileprovision is absent"
             echo "::error::commit your own profile at sign/profile.mobileprovision"
             exit 1
           fi
-          if [ "$p_bundle" != "$bundle" ]; then
+
+          if ! security cms -D -i "$PROF" > work/prof.plist 2>/dev/null; then
+            echo "::error::profile does not decode; re-export it from the portal"
+            exit 1
+          fi
+
+          p_team="$(plutil -extract TeamIdentifier.0 raw -o - work/prof.plist 2>/dev/null || true)"
+          p_bundle="$(plutil -extract Entitlements.application-identifier raw -o - work/prof.plist 2>/dev/null || true)"
+          p_bundle="${p_bundle#*.}"
+          p_group="$(plutil -extract Entitlements.com.apple.security.application-groups json -o - work/prof.plist 2>/dev/null | jq -r '.[0] // empty' || true)"
+          p_exp="$(plutil -extract ExpirationDate raw -o - work/prof.plist 2>/dev/null || true)"
+
+          echo "profile team  : ${p_team:-<none>}"
+          echo "profile bundle: ${p_bundle:-<none>}"
+          echo "profile group : ${p_group:-<none>}"
+          echo "profile expiry: ${p_exp:-<none>}"
+
+          if [ -n "$p_exp" ]; then
+            exp_epoch="$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$p_exp" '+%s' 2>/dev/null || true)"
+            if [ -n "$exp_epoch" ] && [ "$exp_epoch" -lt "$(date '+%s')" ]; then
+              echo "::error::profile expired on $p_exp; re-export it"
+              exit 1
+            fi
+          fi
+
+          if [ -z "${TEAM_ID:-}" ]; then
+            if [ -z "$p_team" ]; then
+              echo "::error::no team in profile and TEAM_ID unset"
+              exit 1
+            fi
+            echo "::warning::TEAM_ID unset; adopting profile team $p_team"
+            TEAM_ID="$p_team"
+            echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+          elif [ -n "$p_team" ] && [ "$p_team" != "$TEAM_ID" ]; then
+            echo "::error::profile team '$p_team' != TEAM_ID '$TEAM_ID'; codesign will fail"
+            echo "::error::export a profile for team '$TEAM_ID' or clear the secret"
+            exit 1
+          fi
+
+          trusted="$explicit"
+          if [ -z "$trusted" ] && [ -n "$p_team" ] && [ "$p_team" = "$TEAM_ID" ]; then trusted=1; fi
+          if [ -z "$trusted" ]; then
+            echo "::error::payload profile belongs to team '${p_team:-?}', not yours"
+            echo "::error::commit your own profile at sign/profile.mobileprovision"
+            exit 1
+          fi
+
+          bundle="${WANT_BUNDLE_ID:-}"
+          if [ -z "$bundle" ] && [ -n "$p_bundle" ] && [ "$p_bundle" != *'*' ]; then
+            bundle="$p_bundle"
+          fi
+          if [ -z "$bundle" ]; then
+            if [ "$p_bundle" = *'*' ]; then
+              echo "profile uses a wildcard app id; using $FALLBACK_BUNDLE_ID"
+            fi
+            bundle="$FALLBACK_BUNDLE_ID"
+          fi
+
+          group="${WANT_GROUP_ID:-}"
+          if [ -z "$group" ] && [ -n "$p_group" ]; then group="$p_group"; fi
+          if [ -z "$group" ]; then group="$FALLBACK_GROUP_ID"; fi
+
+          echo "final bundle: $bundle (${#bundle} chars)"
+          echo "final group : $group"
+          if [ "${#bundle}" -gt 18 ]; then
+            echo "::warning::$bundle is ${#bundle} chars; Mach-O string patch skips above 18"
+            echo "::warning::use a shorter App ID if the binary must carry it"
+          fi
+
+          if [ "$p_bundle" = *'*' ]; then
+            suffix="${p_bundle#\*}"
+            case "$bundle" in
+              *"$suffix") ;;
+              *)
+                echo "::error::profile wildcard '$p_bundle' does not match '$bundle'"
+                exit 1
+                ;;
+            esac
+          elif [ "$p_bundle" != "$bundle" ]; then
             echo "::error::profile is for '$p_bundle' but target is '$bundle'"
-            echo "::error::either commit a profile for '$bundle', or set"
-            echo "::error::BUNDLE_ID=$p_bundle and APP_GROUP_ID=$p_group"
+            echo "::error::set BUNDLE_ID=$p_bundle (and APP_GROUP_ID=$p_group)"
+            echo "::error::or export a profile for '$bundle'"
             exit 1
           fi
-          if [ -n "$p_group" ] && [ "$p_group" != "$group" ]; then
-            echo "::error::profile carries group '$p_group', not '$group'"
-            echo "::error::enable '$group' on the App ID and regenerate the profile,"
-            echo "::error::or set APP_GROUP_ID=$p_group"
-            exit 1
-          fi
+
           if [ -z "$p_group" ]; then
             echo "::error::profile carries no application-groups entitlement"
-            echo "::error::enable the App Group on the App ID and regenerate"
+            echo "::error::enable the App Group on the App ID, then re-export"
             exit 1
           fi
+          if [ "$p_group" != "$group" ]; then
+            echo "::error::profile carries group '$p_group', not '$group'"
+            echo "::error::set APP_GROUP_ID=$p_group, or enable '$group' and re-export"
+            exit 1
+          fi
+
+          echo "BUNDLE_ID=$bundle" >> "$GITHUB_ENV"
+          echo "APP_GROUP_ID=$group" >> "$GITHUB_ENV"
 
       - name: Rewrite author identity
         run: |
