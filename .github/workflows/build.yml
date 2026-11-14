@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "URL of the a-Shell 2.3.2 IPA (overrides the secret)"
+        description: "Direct URL to the a-Shell 2.3.2 IPA (overrides secret/variable)"
         required: false
         type: string
   push:
@@ -30,10 +30,8 @@ env:
 
 jobs:
   build:
-    # macos-latest resolves unconditionally.  macos-14-arm64-us-default only
-    # resolves if a larger runner with that exact label is registered at org
-    # level; without one the job cancels in ~1s before any step runs.
-    # Cross-compiling to arm64 works fine from the x86_64 image.
+    # macos-latest resolves unconditionally; cross-compiling to arm64 works
+    # from the x86_64 image.  The old label needed a registered larger runner.
     runs-on: macos-latest
     timeout-minutes: 45
 
@@ -43,10 +41,10 @@ jobs:
 
       - name: Report runner
         run: |
-          echo "label : macos-latest"
           echo "arch  : $(uname -m)"
           echo "xcode : $(xcodebuild -version | head -1)"
           echo "sha   : $GITHUB_SHA"
+          echo "ref   : $GITHUB_REF"
 
       - name: Install toolchain
         run: |
@@ -58,20 +56,56 @@ jobs:
         env:
           INPUT_URL: ${{ inputs.ipa_url }}
           SECRET_URL: ${{ secrets.ASHELL_IPA_URL }}
+          VARIABLE_URL: ${{ vars.ASHELL_IPA_URL }}
         run: |
-          url="${INPUT_URL:-$SECRET_URL}"
+          echo "input   : ${INPUT_URL:+present}"
+          echo "secret  : ${SECRET_URL:+present}"
+          echo "variable: ${VARIABLE_URL:+present}"
+
+          url="${INPUT_URL:-}"
+          [ -n "$url" ] || url="${SECRET_URL:-}"
+          [ -n "$url" ] || url="${VARIABLE_URL:-}"
+
           if [ -z "$url" ]; then
-            echo "::error::no IPA URL (set ASHELL_IPA_URL or pass ipa_url)"
+            echo "::error::no IPA URL. Set the ASHELL_IPA_URL secret (Settings >"
+            echo "::error::Secrets and variables > Actions), or dispatch with the"
+            echo "::error::ipa_url input filled in."
             exit 1
           fi
+
+          case "$url" in
+            http://*|https://*) ;;
+            *) echo "::error::URL must start with http:// or https:// (got: $url)"; exit 1 ;;
+          esac
+
+          case "$url" in
+            *drive.google.com*|*dropbox.com/s/*)
+              echo "::warning::looks like a share link, not a direct download;"
+              echo "::warning::Drive needs /uc?export=download&id=..., Dropbox needs ?dl=1"
+              ;;
+          esac
+
           echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "resolved: $url"
 
       - name: Download and unpack IPA
         env:
           IPA_URL: ${{ steps.source.outputs.url }}
         run: |
           mkdir -p work
-          curl -fL --retry 3 --retry-delay 2 -o work/ashell.ipa "$IPA_URL"
+          curl -fL --retry 3 --retry-delay 2 --max-time 300 \
+            -o work/ashell.ipa "$IPA_URL"
+
+          echo "size: $(wc -c < work/ashell.ipa) bytes"
+          echo "type: $(file -b work/ashell.ipa)"
+
+          if ! unzip -tq work/ashell.ipa >/dev/null 2>&1; then
+            echo "::error::downloaded file is not a valid zip/ipa"
+            echo "::error::content-type was probably an HTML page, not the .ipa"
+            head -c 300 work/ashell.ipa
+            exit 1
+          fi
+
           unzip -q work/ashell.ipa -d work/unpacked
           APP="$(find work/unpacked/Payload -maxdepth 1 -name '*.app' -print -quit)"
           if [ -z "$APP" ]; then
