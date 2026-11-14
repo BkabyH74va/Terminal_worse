@@ -14,6 +14,9 @@ on:
       - "scripts/**"
       - ".github/workflows/build.yml"
 
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
@@ -21,11 +24,16 @@ concurrency:
 env:
   APP_GROUP_ID: ${{ secrets.APP_GROUP_ID || 'group.com.jasonquiles.terminal' }}
   BUNDLE_ID: ${{ secrets.BUNDLE_ID || 'com.jasonquiles.terminal' }}
-  TEAM_ID: ${{ secrets.TEAM_ID || '' }}
-  ASHELL_VERSION: "2.3.2"
+  TEAM_ID: ${{ secrets.TEAM_ID }}
+  OLD_GROUP: ${{ secrets.OLD_GROUP }}
+  OLD_BUNDLE: ${{ secrets.OLD_BUNDLE }}
 
 jobs:
   build:
+    # macos-14 = GitHub-hosted standard image (x86_64).  The
+    # "macos-14-arm64-us-default" label needs a registered larger runner;
+    # without one the job cancels before the first step.  macos-14-arm64 is
+    # the hosted arm64 label and is public-repo only.
     runs-on: macos-14
     timeout-minutes: 45
 
@@ -36,8 +44,8 @@ jobs:
       - name: Install toolchain
         run: |
           brew install ldid xz coreutils
-          python3 -m pip install --quiet --upgrade pip
           echo "clang: $(clang --version | head -1)"
+          echo "runner: $(uname -m)"
 
       - name: Resolve IPA source
         id: source
@@ -47,7 +55,7 @@ jobs:
         run: |
           url="${INPUT_URL:-$SECRET_URL}"
           if [ -z "$url" ]; then
-            echo "::error::no IPA URL (set the ASHELL_IPA_URL secret or pass ipa_url)"
+            echo "::error::no IPA URL (set ASHELL_IPA_URL or pass ipa_url)"
             exit 1
           fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
@@ -58,22 +66,14 @@ jobs:
         run: |
           mkdir -p work
           curl -fL --retry 3 --retry-delay 2 -o work/ashell.ipa "$IPA_URL"
-          file work/ashell.ipa
           unzip -q work/ashell.ipa -d work/unpacked
           APP="$(find work/unpacked/Payload -maxdepth 1 -name '*.app' -print -quit)"
-          if [ -z "$APP" ]; then
-            echo "::error::Payload contains no .app"
-            find work/unpacked -maxdepth 3 -print
-            exit 1
-          fi
+          [ -n "$APP" ] || { echo "::error::Payload has no .app"; find work/unpacked -maxdepth 3; exit 1; }
           mv "$APP" work/Terminal.app
           echo "APP=work/Terminal.app" >> "$GITHUB_ENV"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' work/Terminal.app/Info.plist
 
       - name: Rewrite author identity
-        env:
-          OLD_GROUP: "group.com.cert.account.t260930000125.01"
-          OLD_BUNDLE: ${{ secrets.OLD_BUNDLE_ID || '' }}
         run: |
           args=(--app "$APP" --new-group "$APP_GROUP_ID" --new-bundle "$BUNDLE_ID")
           if [ -n "$OLD_GROUP" ]; then args+=(--old-group "$OLD_GROUP"); fi
@@ -81,41 +81,36 @@ jobs:
           python3 scripts/rewrite_ids.py "${args[@]}"
 
       - name: Build dylib
-        run: |
-          mkdir -p work/out
-          xcrun --sdk iphoneos clang \
-            -arch arm64 -arch arm64e \
-            -miphoneos-version-min=16.0 \
-            -dynamiclib -fobjc-arc -O2 \
-            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
-            -framework Foundation -framework UIKit -framework CoreFoundation \
-            -framework Security -framework Metal \
-            -DSBX_APP_GROUP="\"$APP_GROUP_ID\"" \
-            -DSBX_APP_GROUP_BUNDLE_ID="\"$BUNDLE_ID\"" \
-            -install_name @executable_path/TerminalSBX.dylib \
-            -o work/out/TerminalSBX.dylib \
-            src/TerminalSBX.m
-          lipo -info work/out/TerminalSBX.dylib
-          cp work/out/TerminalSBX.dylib "$APP/"
+        env:
+          APP: ${{ env.APP }}
+          OUT: work/TerminalSBX.dylib
+          PROFILE: work/Terminal.app/embedded.mobileprovision
+        run: bash scripts/build_dylib_ci.sh
 
       - name: Inject load command
         run: |
-          if command -v insert_dylib >/dev/null 2>&1; then
-            insert_dylib --inplace --weak \
-              @executable_path/TerminalSBX.dylib "$APP/Terminal"
+          cp work/TerminalSBX.dylib "$APP/"
+          if python3 scripts/inject_dylib.py "$APP/Terminal" \
+               @executable_path/TerminalSBX.dylib 2>/dev/null; then
+            echo "injected with inject_dylib.py"
+          elif python3 scripts/inject_dylib.py --binary "$APP/Terminal" \
+               --dylib @executable_path/TerminalSBX.dylib; then
+            echo "injected with inject_dylib.py (flag form)"
           else
             curl -fsSL -o /tmp/insert_dylib \
               https://github.com/tyilo/insert_dylib/releases/latest/download/insert_dylib
             chmod +x /tmp/insert_dylib
             /tmp/insert_dylib --inplace --weak \
               @executable_path/TerminalSBX.dylib "$APP/Terminal"
+            echo "injected with insert_dylib"
           fi
-          otool -L "$APP/Terminal" | grep -i terminalsbx
+          otool -L "$APP/Terminal" | grep -qi terminalsbx \
+            || { echo "::error::dylib not in load commands"; exit 1; }
 
       - name: Patch app
         run: |
           /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Terminal' "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.jasonquiles.terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Set :CFBundleName Terminal' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Terminal' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :AppGroupIdentifier $APP_GROUP_ID" \
@@ -123,37 +118,11 @@ jobs:
             /usr/libexec/PlistBuddy -c "Add :AppGroupIdentifier string $APP_GROUP_ID" \
               "$APP/Info.plist"
           echo "group in plist: $(/usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist")"
-          grep -q "$APP_GROUP_ID" scripts/ent.plist \
-            || echo "::warning::ent.plist group does not match plist group"
+          grep -qF "$APP_GROUP_ID" scripts/ent.plist \
+            || echo "::warning::ent.plist group does not match $APP_GROUP_ID"
 
       - name: Sign
-        run: |
-          if [ -z "$TEAM_ID" ]; then
-            echo "::error::TEAM_ID secret is empty"
-            exit 1
-          fi
-          sed "s/TEAMID/$TEAM_ID/g" scripts/ent.plist > work/ent.plist
-          /usr/libexec/PlistBuddy -c 'Print' work/ent.plist
-          ldid -S work/ent.plist "$APP/Terminal"
-          ldid -S work/ent.plist "$APP/TerminalSBX.dylib"
-          codesign --force --sign - --timestamp=none \
-            --entitlements work/ent.plist \
-            --preserve-metadata=identifier,flags \
-            "$APP/Frameworks/"*.framework 2>/dev/null || true
-          codesign --force --sign - --timestamp=none \
-            --entitlements work/ent.plist "$APP"
-          codesign -dv --entitlements :- "$APP" 2>&1 | head -40
-
-      - name: Verify entitlements
-        run: |
-          codesign -d --entitlements :- "$APP" 2>/dev/null > work/check.plist || true
-          if grep -q "$APP_GROUP_ID" work/check.plist; then
-            echo "group entitlement present"
-          else
-            echo "::warning::group $APP_GROUP_ID not found in signed entitlements"
-          fi
-          test -f "$APP/TerminalSBX.dylib"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+        run: bash scripts/sign_all.sh "$APP"
 
       - name: Package
         run: |
@@ -166,7 +135,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Terminal-${{ env.ASHELL_VERSION }}-${{ github.run_number }}
+          name: Terminal-2.3.2-${{ github.run_number }}
           path: |
             work/Terminal.ipa
             work/Terminal.ipa.sha256
