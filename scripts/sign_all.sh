@@ -11,14 +11,19 @@ if [ -z "$TEAM_ID" ]; then
   exit 1
 fi
 for tool in ldid codesign plutil; do
-  command -v "$tool" >/dev/null || { echo "error: missing $tool" >&2; exit 1; }
+  if ! command -v "$tool" >/dev/null; then
+    echo "error: missing $tool" >&2
+    exit 1
+  fi
 done
-[ -d "$APP" ] || { echo "error: $APP not found" >&2; exit 1; }
+if [ ! -d "$APP" ]; then
+  echo "error: $APP not found" >&2
+  exit 1
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# Substitute the team id and force the group, whatever ent.plist held.
 sed -e "s/TEAMID/$TEAM_ID/g" \
     -e "s|group\.com\.jasonquiles\.terminal|$APP_GROUP|g" \
     scripts/ent.plist > "$WORK/ent.plist"
@@ -36,15 +41,17 @@ fi
 
 EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
 BIN="$APP/$EXEC"
-[ -f "$BIN" ] || { echo "error: $BIN not found" >&2; exit 1; }
+if [ ! -f "$BIN" ]; then
+  echo "error: $BIN not found" >&2
+  exit 1
+fi
 
-# Identifier must agree with what the entitlement signs for.
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
 
-find "$APP" -name '*.dylib' -o -name '*.framework' -type d 2>/dev/null | while read -r item; do
+while IFS= read -r -d '' item; do
   echo "signing $item"
-  ldid -S "$WORK/ent.plist" "$item"
-done
+  ldid -S "$WORK/ent.plist" "$item" || exit 1
+done < <(find "$APP" \( -name '*.dylib' -o -name '*.framework' \) -print0)
 
 ldid -S "$WORK/ent.plist" "$BIN"
 codesign --force --sign - --timestamp=none --entitlements "$WORK/ent.plist" "$APP"
