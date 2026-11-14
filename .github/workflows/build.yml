@@ -30,22 +30,28 @@ env:
 
 jobs:
   build:
-    # macos-14 = GitHub-hosted standard image (x86_64).  The
-    # "macos-14-arm64-us-default" label needs a registered larger runner;
-    # without one the job cancels before the first step.  macos-14-arm64 is
-    # the hosted arm64 label and is public-repo only.
-    runs-on: macos-14
+    # macos-latest resolves unconditionally.  macos-14-arm64-us-default only
+    # resolves if a larger runner with that exact label is registered at org
+    # level; without one the job cancels in ~1s before any step runs.
+    # Cross-compiling to arm64 works fine from the x86_64 image.
+    runs-on: macos-latest
     timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Report runner
+        run: |
+          echo "label : macos-latest"
+          echo "arch  : $(uname -m)"
+          echo "xcode : $(xcodebuild -version | head -1)"
+          echo "sha   : $GITHUB_SHA"
+
       - name: Install toolchain
         run: |
           brew install ldid xz coreutils
           echo "clang: $(clang --version | head -1)"
-          echo "runner: $(uname -m)"
 
       - name: Resolve IPA source
         id: source
@@ -68,7 +74,11 @@ jobs:
           curl -fL --retry 3 --retry-delay 2 -o work/ashell.ipa "$IPA_URL"
           unzip -q work/ashell.ipa -d work/unpacked
           APP="$(find work/unpacked/Payload -maxdepth 1 -name '*.app' -print -quit)"
-          [ -n "$APP" ] || { echo "::error::Payload has no .app"; find work/unpacked -maxdepth 3; exit 1; }
+          if [ -z "$APP" ]; then
+            echo "::error::Payload has no .app"
+            find work/unpacked -maxdepth 3
+            exit 1
+          fi
           mv "$APP" work/Terminal.app
           echo "APP=work/Terminal.app" >> "$GITHUB_ENV"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' work/Terminal.app/Info.plist
