@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "Direct URL to an .ipa or .zip (blank = auto-discover / use ipa/ folder)"
+        description: "Direct URL to an .ipa or .zip (blank = ipa/ folder, then auto-discover)"
         required: false
         type: string
       tag:
-        description: "Release tag to discover assets from (blank = newest)"
+        description: "Release tag to inspect (blank = newest)"
         required: false
         default: "2.3.2"
         type: string
@@ -66,11 +66,13 @@ jobs:
           TAG: ${{ inputs.tag }}
           SECRET_URL: ${{ secrets.ASHELL_IPA_URL }}
           VARIABLE_URL: ${{ vars.ASHELL_IPA_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           show() { if [ -n "$2" ]; then echo "$1: set"; else echo "$1: unset"; fi; }
           show "input"    "${INPUT_URL:-}"
           show "secret"   "${SECRET_URL:-}"
           show "variable" "${VARIABLE_URL:-}"
+          echo  "tag     : ${TAG:-<blank>}"
 
           emit() { echo "kind=$1" >> "$GITHUB_OUTPUT"; echo "value=$2" >> "$GITHUB_OUTPUT"; }
 
@@ -79,7 +81,7 @@ jobs:
           if [ -n "${SECRET_URL:-}" ]; then emit url "$SECRET_URL"; echo "source: secret"; exit 0; fi
           if [ -n "${VARIABLE_URL:-}" ]; then emit url "$VARIABLE_URL"; echo "source: variable"; exit 0; fi
 
-          # 4: an .ipa/.zip committed under ipa/ needs no network at all
+          # 4: a committed .ipa/.zip needs no network at all
           LOCAL="$(find ipa -maxdepth 2 \( -iname '*.ipa' -o -iname '*.zip' \) -print 2>/dev/null | head -1)"
           if [ -n "$LOCAL" ]; then
             emit local "$LOCAL"
@@ -87,38 +89,103 @@ jobs:
             exit 0
           fi
 
-          # 5: discover the real asset name from the releases API
+          # 5: API, authenticated, with the status kept instead of discarded
           API="https://api.github.com/repos/$UPSTREAM_REPO/releases"
           HDR=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28')
-          resp=""
-          if [ -n "${TAG:-}" ]; then
-            resp="$(curl -fsSL "${HDR[@]}" "$API/tags/$TAG" 2>/dev/null)" || resp=""
-            echo "tried tag: $TAG"
-          fi
-          if [ -z "$resp" ]; then
-            resp="$(curl -fsSL "${HDR[@]}" "$API/latest" 2>/dev/null)" || resp=""
-            echo "fell back to: latest"
+          if [ -n "${GH_TOKEN:-}" ]; then
+            HDR+=(-H "Authorization: Bearer $GH_TOKEN")
+            echo "api auth: token (5000/hr)"
+          else
+            echo "api auth: anonymous (60/hr, shared IP)"
           fi
 
-          if [ -z "$resp" ]; then
-            echo "::error::releases API returned nothing (rate limit or bad tag)"
+          BODY=""
+          STATUS="000"
+          fetch() {
+            local raw
+            BODY=""
+            STATUS="000"
+            raw="$(curl -sS --max-time 30 -w '\n%{http_code}' "${HDR[@]}" "$API/$1")" || raw=""
+            if [ -z "$raw" ]; then
+              return 0
+            fi
+            STATUS="${raw##*$'\n'}"
+            BODY="${raw%$'\n'*}"
+            if [ "$STATUS" != "200" ]; then
+              BODY=""
+            fi
+          }
+
+          if [ -n "${TAG:-}" ]; then
+            echo "GET releases/tags/$TAG"
+            fetch "tags/$TAG"
+            echo "  status: $STATUS"
+            if [ "$STATUS" = "404" ]; then
+              echo "  tag does not exist"
+            fi
+          fi
+
+          if [ -z "$BODY" ]; then
+            echo "GET releases/latest"
+            fetch "latest"
+            echo "  status: $STATUS"
+          fi
+
+          # 6: HTML asset listing, no API quota consumed
+          if [ -z "$BODY" ]; then
+            echo "::warning::API unusable (last status $STATUS); trying HTML listing"
+            tag_html="${TAG:-}"
+            if [ -z "$tag_html" ]; then
+              loc="$(curl -sS -o /dev/null -w '%{redirect_url}' \
+                     "https://github.com/$UPSTREAM_REPO/releases/latest" || true)"
+              tag_html="${loc##*/}"
+            fi
+            echo "html tag: ${tag_html:-<unknown>}"
+            if [ -n "$tag_html" ] && [ "$tag_html" != "latest" ]; then
+              html="$(curl -fsSL --max-time 30 \
+                      "https://github.com/$UPSTREAM_REPO/releases/expanded_assets/$tag_html" 2>/dev/null || true)"
+              if [ -n "$html" ]; then
+                echo "assets on $tag_html (html):"
+                printf '%s' "$html" | grep -oE '/[^"/]+/[^"/]+/releases/download/[^"]+' \
+                  | sort -u | sed 's/^/  /' || true
+                rel="$(printf '%s' "$html" | grep -oE '/[^"]+\.ipa' | head -1 || true)"
+                if [ -n "$rel" ]; then
+                  emit url "https://github.com$rel"
+                  echo "source: html asset"
+                  echo "resolved: https://github.com$rel"
+                  exit 0
+                fi
+              fi
+            fi
+          fi
+
+          if [ -z "$BODY" ]; then
+            echo "::error::no release data from API or HTML (last status $STATUS)"
+            echo "::error::see https://github.com/$UPSTREAM_REPO/releases"
             exit 1
           fi
 
-          echo "--- assets on $(printf '%s' "$resp" | jq -r '.tag_name') ---"
-          printf '%s' "$resp" | jq -r '.assets[]?.name' | sed 's/^/  /' || true
-
-          url="$(printf '%s' "$resp" | jq -r '.assets[]?.browser_download_url' \
-                 | grep -iE '\.ipa$' | head -1)"
-          if [ -z "$url" ]; then
-            url="$(printf '%s' "$resp" | jq -r '.assets[]?.browser_download_url' \
-                   | grep -iE '\.zip$' | head -1)"
+          tag_name="$(printf '%s' "$BODY" | jq -r '.tag_name // "?"')"
+          count="$(printf '%s' "$BODY" | jq -r '.assets | length')"
+          echo "release: $tag_name, uploaded assets: $count"
+          if [ "$count" -gt 0 ]; then
+            printf '%s' "$BODY" | jq -r '.assets[] | "  \(.name)  \(.size) bytes"'
           fi
 
+          if [ "$count" -eq 0 ]; then
+            echo "::error::release $tag_name carries no uploaded assets (source-only tag)"
+            echo "::error::commit an .ipa under ipa/ or paste a direct link"
+            exit 1
+          fi
+
+          url="$(printf '%s' "$BODY" | jq -r '.assets[]?.browser_download_url' \
+                 | grep -iE '\.ipa$' | head -1 || true)"
           if [ -z "$url" ]; then
-            echo "::error::no .ipa or .zip asset on this release"
-            echo "::error::open https://github.com/$UPSTREAM_REPO/releases and copy a link"
-            echo "::error::into the ipa_url box, or commit the file under ipa/"
+            url="$(printf '%s' "$BODY" | jq -r '.assets[]?.browser_download_url' \
+                   | grep -iE '\.zip$' | grep -viE 'source|src' | head -1 || true)"
+          fi
+          if [ -z "$url" ]; then
+            echo "::error::no .ipa and no usable .zip among the assets listed above"
             exit 1
           fi
 
@@ -164,7 +231,6 @@ jobs:
             exit 1
           fi
 
-          # accept both a raw .ipa and a .zip containing one
           if [ ! -d work/unpacked/Payload ]; then
             inner="$(find work/unpacked -maxdepth 3 -iname '*.ipa' -print -quit)"
             if [ -z "$inner" ]; then
