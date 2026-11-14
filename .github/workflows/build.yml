@@ -1,170 +1,174 @@
-name: Build
+name: build
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL of the a-Shell 2.3.2 IPA (overrides the secret)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_GROUP_ID: ${{ secrets.APP_GROUP_ID || 'group.com.jasonquiles.terminal' }}
+  BUNDLE_ID: ${{ secrets.BUNDLE_ID || 'com.jasonquiles.terminal' }}
+  TEAM_ID: ${{ secrets.TEAM_ID || '' }}
+  ASHELL_VERSION: "2.3.2"
 
 jobs:
   build:
-    runs-on: macos-latest
-    timeout-minutes: 40
+    runs-on: macos-14
+    timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Select Xcode
+      - name: Install toolchain
         run: |
-          XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)"
-          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE"
-          xcodebuild -version
+          brew install ldid xz coreutils
+          python3 -m pip install --quiet --upgrade pip
+          echo "clang: $(clang --version | head -1)"
 
-      - name: Preflight
+      - name: Resolve IPA source
+        id: source
+        env:
+          INPUT_URL: ${{ inputs.ipa_url }}
+          SECRET_URL: ${{ secrets.ASHELL_IPA_URL }}
         run: |
-          echo "--- tree ---"
-          find . -maxdepth 2 -not -path './.git/*' | sort | head -n60
-          echo "--- project files ---"
-          find . -name '*.xcodeproj' -o -name 'Package.swift' | head
-          echo "--- dylib source ---"
-          ls -l src/TerminalSBX.m || echo "MISSING src/TerminalSBX.m"
-          echo "--- includes in source ---"
-          grep -nE '^#(import|include)' src/TerminalSBX.m || true
-          echo "--- input IPA ---"
-          ls -l work/*.ipa a-Shell*.ipa *.ipa 2>/dev/null || echo "no IPA in repo"
-          echo "--- scripts present ---"
-          ls -1 scripts 2>/dev/null || true
+          url="${INPUT_URL:-$SECRET_URL}"
+          if [ -z "$url" ]; then
+            echo "::error::no IPA URL (set the ASHELL_IPA_URL secret or pass ipa_url)"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Download and unpack IPA
+        env:
+          IPA_URL: ${{ steps.source.outputs.url }}
+        run: |
+          mkdir -p work
+          curl -fL --retry 3 --retry-delay 2 -o work/ashell.ipa "$IPA_URL"
+          file work/ashell.ipa
+          unzip -q work/ashell.ipa -d work/unpacked
+          APP="$(find work/unpacked/Payload -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::Payload contains no .app"
+            find work/unpacked -maxdepth 3 -print
+            exit 1
+          fi
+          mv "$APP" work/Terminal.app
+          echo "APP=work/Terminal.app" >> "$GITHUB_ENV"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' work/Terminal.app/Info.plist
+
+      - name: Rewrite author identity
+        env:
+          OLD_GROUP: "group.com.cert.account.t260930000125.01"
+          OLD_BUNDLE: ${{ secrets.OLD_BUNDLE_ID || '' }}
+        run: |
+          args=(--app "$APP" --new-group "$APP_GROUP_ID" --new-bundle "$BUNDLE_ID")
+          if [ -n "$OLD_GROUP" ]; then args+=(--old-group "$OLD_GROUP"); fi
+          if [ -n "$OLD_BUNDLE" ]; then args+=(--old-bundle "$OLD_BUNDLE"); fi
+          python3 scripts/rewrite_ids.py "${args[@]}"
 
       - name: Build dylib
         run: |
-          chmod +x scripts/*.sh 2>/dev/null || true
-          sh scripts/build_dylib_ci.sh
+          mkdir -p work/out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -miphoneos-version-min=16.0 \
+            -dynamiclib -fobjc-arc -O2 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -framework Security -framework Metal \
+            -DSBX_APP_GROUP="\"$APP_GROUP_ID\"" \
+            -DSBX_APP_GROUP_BUNDLE_ID="\"$BUNDLE_ID\"" \
+            -install_name @executable_path/TerminalSBX.dylib \
+            -o work/out/TerminalSBX.dylib \
+            src/TerminalSBX.m
+          lipo -info work/out/TerminalSBX.dylib
+          cp work/out/TerminalSBX.dylib "$APP/"
 
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: TerminalSBX-dylib
-          path: out/TerminalSBX.dylib
-          if-no-files-found: error
-
-  ipa:
-    needs: build
-    if: ${{ vars.HAS_IPA == 'true' }}
-    runs-on: macos-latest
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Select Xcode
+      - name: Inject load command
         run: |
-          XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)"
-          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE"
-
-      - name: Fetch input IPA
-        run: |
-          mkdir -p work
-          if [ -f work/a-Shell_2.3.2.ipa ]; then
-            echo "using committed IPA"
-          elif [ -n "${{ secrets.IPA_URL }}" ]; then
-            curl -fL --retry 3 -o work/a-Shell_2.3.2.ipa "${{ secrets.IPA_URL }}"
+          if command -v insert_dylib >/dev/null 2>&1; then
+            insert_dylib --inplace --weak \
+              @executable_path/TerminalSBX.dylib "$APP/Terminal"
           else
-            echo "no IPA available"; exit 1
+            curl -fsSL -o /tmp/insert_dylib \
+              https://github.com/tyilo/insert_dylib/releases/latest/download/insert_dylib
+            chmod +x /tmp/insert_dylib
+            /tmp/insert_dylib --inplace --weak \
+              @executable_path/TerminalSBX.dylib "$APP/Terminal"
           fi
-          ls -l work/
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: TerminalSBX-dylib
-          path: out
-
-      - name: Import signing identity
-        env:
-          CERT: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-          CERT_PW: ${{ secrets.P12_PASSWORD }}
-          PROFILE: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
-        run: |
-          set -euo pipefail
-          KEYCHAIN="$RUNNER_TEMP/build.keychain"
-          KEYCHAIN_PW="$(openssl rand -hex 16)"
-          echo "$CERT" | base64 -d > "$RUNNER_TEMP/cert.p12"
-          echo "$PROFILE" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security set-keychain-settings -lut 3600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
-            -P "$CERT_PW" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: \
-            -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$RUNNER_TEMP/profile.mobileprovision" \
-            ~/Library/MobileDevice/Provisioning\ Profiles/
-          security find-identity -v -p codesigning "$KEYCHAIN"
+          otool -L "$APP/Terminal" | grep -i terminalsbx
 
       - name: Patch app
         run: |
-          set -euo pipefail
-          rm -rf work/extract && mkdir -p work/extract
-          unzip -q work/a-Shell_2.3.2.ipa -d work/extract
-          APP="$(find work/extract/Payload -maxdepth 1 -name '*.app' | head -n1)"
-          [ -n "$APP" ] || { echo "no .app in IPA"; exit 1; }
-          echo "app: $APP"
-
-          EXEC="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
-          mv "$APP/$EXEC" "$APP/Terminal"
-          for k in CFBundleExecutable CFBundleName CFBundleDisplayName CFBundleIdentifier; do :; done
           /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Terminal' "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.apple.Terminal' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.jasonquiles.terminal' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Set :CFBundleName Terminal' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Terminal' "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :AppGroupIdentifier ${{ secrets.APP_GROUP_ID }}" \
+          /usr/libexec/PlistBuddy -c "Set :AppGroupIdentifier $APP_GROUP_ID" \
             "$APP/Info.plist" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c "Add :AppGroupIdentifier string ${{ secrets.APP_GROUP_ID }}" \
+            /usr/libexec/PlistBuddy -c "Add :AppGroupIdentifier string $APP_GROUP_ID" \
               "$APP/Info.plist"
-
-          mkdir -p "$APP/Frameworks"
-          cp out/TerminalSBX.dylib "$APP/Frameworks/"
-          [ -d env ] && mkdir -p "$APP/bin" && cp env/* "$APP/bin/"
-          if [ -f icon/out/Assets.car ]; then
-            cp icon/out/Assets.car "$APP/"
-            cp icon/out/DisplayIcon*.png "$APP/" 2>/dev/null || true
-          fi
-
-          cp "$RUNNER_TEMP/profile.mobileprovision" "$APP/embedded.mobileprovision" 2>/dev/null || true
-
-      - name: Inject LC_LOAD_DYLIB
-        run: |
-          set -euo pipefail
-          pip install --quiet lief
-          APP="$(find work/extract/Payload -maxdepth 1 -name '*.app' | head -n1)"
-          python3 scripts/inject_dylib.py "$APP/Terminal" \
-            @executable_path/Frameworks/TerminalSBX.dylib
-          otool -L "$APP/Terminal" | grep -i terminalSBX && echo "injection confirmed"
+          echo "group in plist: $(/usr/libexec/PlistBuddy -c 'Print :AppGroupIdentifier' "$APP/Info.plist")"
+          grep -q "$APP_GROUP_ID" scripts/ent.plist \
+            || echo "::warning::ent.plist group does not match plist group"
 
       - name: Sign
         run: |
-          set -euo pipefail
-          APP="$(find work/extract/Payload -maxdepth 1 -name '*.app' | head -n1)"
-          ID="$(security find-identity -v -p codesigning | head -n1 | sed 's/.*"\(.*\)"/\1/')"
-          echo "identity: $ID"
-          find "$APP" -name '*.dylib' -o -name '*.framework' -type d | while read -r f; do
-            codesign -f -s "$ID" --timestamp=none "$f"
-          done
-          codesign -f -s "$ID" --entitlements scripts/ent.plist \
-            --generate-entitlement-der "$APP"
-          codesign -vvv "$APP"
+          if [ -z "$TEAM_ID" ]; then
+            echo "::error::TEAM_ID secret is empty"
+            exit 1
+          fi
+          sed "s/TEAMID/$TEAM_ID/g" scripts/ent.plist > work/ent.plist
+          /usr/libexec/PlistBuddy -c 'Print' work/ent.plist
+          ldid -S work/ent.plist "$APP/Terminal"
+          ldid -S work/ent.plist "$APP/TerminalSBX.dylib"
+          codesign --force --sign - --timestamp=none \
+            --entitlements work/ent.plist \
+            --preserve-metadata=identifier,flags \
+            "$APP/Frameworks/"*.framework 2>/dev/null || true
+          codesign --force --sign - --timestamp=none \
+            --entitlements work/ent.plist "$APP"
+          codesign -dv --entitlements :- "$APP" 2>&1 | head -40
+
+      - name: Verify entitlements
+        run: |
+          codesign -d --entitlements :- "$APP" 2>/dev/null > work/check.plist || true
+          if grep -q "$APP_GROUP_ID" work/check.plist; then
+            echo "group entitlement present"
+          else
+            echo "::warning::group $APP_GROUP_ID not found in signed entitlements"
+          fi
+          test -f "$APP/TerminalSBX.dylib"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
 
       - name: Package
         run: |
-          set -euo pipefail
-          cd work/extract
-          rm -rf Payload/__MACOSX
-          zip -qry ../Terminal_worse.ipa Payload
-          cd ../..
-          ls -l work/Terminal_worse.ipa
+          mkdir -p work/Payload
+          cp -R "$APP" work/Payload/
+          (cd work && zip -qry Terminal.ipa Payload)
+          shasum -a 256 work/Terminal.ipa | tee work/Terminal.ipa.sha256
+          ls -lh work/Terminal.ipa
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload
+        uses: actions/upload-artifact@v4
         with:
-          name: Terminal_worse-ipa
-          path: work/Terminal_worse.ipa
+          name: Terminal-${{ env.ASHELL_VERSION }}-${{ github.run_number }}
+          path: |
+            work/Terminal.ipa
+            work/Terminal.ipa.sha256
           if-no-files-found: error
+          retention-days: 30
